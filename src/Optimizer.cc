@@ -45,20 +45,51 @@ void Optimizer::GlobalBundleAdjustemnt(Map* pMap, int nIterations, bool* pbStopF
     BundleAdjustment(vpKFs,vpMP,nIterations,pbStopFlag, nLoopKF, bRobust);
 }
 
-
+// pMap中所有的MapPoints和关键帧做bundle adjustment优化
+// 这个全局BA优化在本程序中有两个地方使用：
+// a.单目初始化：CreateInitialMapMonocular函数
+// b.闭环优化：RunGlobalBundleAdjustment函数
+/**
+ * @brief bundle adjustment Optimization
+ *
+ * 3D-2D 最小化重投影误差 e = (u,v) - project(Tcw*Pw) \n
+ *
+ * 1. Vertex: g2o::VertexSE3Expmap()，即当前帧的Tcw
+ *            g2o::VertexSBAPointXYZ()，MapPoint的mWorldPos
+ * 2. Edge:
+ *     - g2o::EdgeSE3ProjectXYZ()，BaseBinaryEdge
+ *         + Vertex：待优化当前帧的Tcw
+ *         + Vertex：待优化MapPoint的mWorldPos
+ *         + measurement：MapPoint在当前帧中的二维位置(u,v)
+ *         + InfoMatrix: invSigma2(与特征点所在的尺度有关)
+ *
+ * @param   vpKFs    关键帧
+ *          vpMP     MapPoints
+ *          nIterations 迭代次数（20次）
+ *          pbStopFlag  是否强制暂停
+ *          nLoopKF  关键帧的个数
+ *          bRobust  是否使用核函数
+ */
 void Optimizer::BundleAdjustment(const vector<KeyFrame *> &vpKFs, const vector<MapPoint *> &vpMP,
                                  int nIterations, bool* pbStopFlag, const unsigned long nLoopKF, const bool bRobust)
 {
     vector<bool> vbNotIncludedMP;
     vbNotIncludedMP.resize(vpMP.size());
 
+    // 典型的 g2o 步骤
+    // 声明一个 优化过程
+    // 声明一个 线性 solver
+    // 步骤1：初始化g2o优化器
     g2o::SparseOptimizer optimizer;
     g2o::BlockSolver_6_3::LinearSolverType * linearSolver;
 
+    // 初始化一个 线性 solver
     linearSolver = new g2o::LinearSolverEigen<g2o::BlockSolver_6_3::PoseMatrixType>();
 
+    // 初始化一个 block solver 用 线性 solver
     g2o::BlockSolver_6_3 * solver_ptr = new g2o::BlockSolver_6_3(linearSolver);
 
+    // 初始化优化过程的算子，Levenberg 算子，用 block solver
     g2o::OptimizationAlgorithmLevenberg* solver = new g2o::OptimizationAlgorithmLevenberg(solver_ptr);
     optimizer.setAlgorithm(solver);
 
@@ -68,6 +99,7 @@ void Optimizer::BundleAdjustment(const vector<KeyFrame *> &vpKFs, const vector<M
     long unsigned int maxKFid = 0;
 
     // Set KeyFrame vertices
+    // 步骤2.1：向优化器添加关键帧位姿顶点
     for(size_t i=0; i<vpKFs.size(); i++)
     {
         KeyFrame* pKF = vpKFs[i];
@@ -76,6 +108,9 @@ void Optimizer::BundleAdjustment(const vector<KeyFrame *> &vpKFs, const vector<M
         g2o::VertexSE3Expmap * vSE3 = new g2o::VertexSE3Expmap();
         vSE3->setEstimate(Converter::toSE3Quat(pKF->GetPose()));
         vSE3->setId(pKF->mnId);
+        // 用来设置改定点在优化过程中是否有变化
+        // 如果 fixed， 则过程中不优化这个点
+        // mnId 为 0 的点为不优化的点
         vSE3->setFixed(pKF->mnId==0);
         optimizer.addVertex(vSE3);
         if(pKF->mnId>maxKFid)
@@ -86,6 +121,8 @@ void Optimizer::BundleAdjustment(const vector<KeyFrame *> &vpKFs, const vector<M
     const float thHuber3D = sqrt(7.815);
 
     // Set MapPoint vertices
+    // 步骤2.2：向优化器添加MapPoints顶点
+    // 步骤3 写在步骤2 里面了：添加边
     for(size_t i=0; i<vpMP.size(); i++)
     {
         MapPoint* pMP = vpMP[i];
@@ -95,13 +132,21 @@ void Optimizer::BundleAdjustment(const vector<KeyFrame *> &vpKFs, const vector<M
         vPoint->setEstimate(Converter::toVector3d(pMP->GetWorldPos()));
         const int id = pMP->mnId+maxKFid+1;
         vPoint->setId(id);
+        // 使用到稀疏的 Hessian 矩阵 就要设置为 true 以进行边缘化求解
+        // 所谓边缘化也叫 Schur 消元法。他先求解了 camera 的变动，然后带入求解地表点的变动
+        // 因为想对于地表点而言，相机位姿点是非常少的，所以边缘化充分利用了 Hessian 矩阵的悉数性
+        // 14 讲-P 253
         vPoint->setMarginalized(true);
         optimizer.addVertex(vPoint);
 
+        ///< 观测到该MapPoint的KF和该MapPoint在KF中的索引
        const map<KeyFrame*,size_t> observations = pMP->GetObservations();
 
+       // 在构建顶点的同时构建边
         int nEdges = 0;
         //SET EDGES
+        // 对所有观察到该顶点（MapPoint）的 camera pose 顶点循环
+        // 该顶点与没一个观察到它的 camera pose 建立边
         for(map<KeyFrame*,size_t>::const_iterator mit=observations.begin(); mit!=observations.end(); mit++)
         {
 
@@ -113,7 +158,7 @@ void Optimizer::BundleAdjustment(const vector<KeyFrame *> &vpKFs, const vector<M
 
             const cv::KeyPoint &kpUn = pKF->mvKeysUn[mit->second];
 
-            if(pKF->mvuRight[mit->second]<0)
+            if(pKF->mvuRight[mit->second]<0) // 单目相机或者 RGBD 相机
             {
                 Eigen::Matrix<double,2,1> obs;
                 obs << kpUn.pt.x, kpUn.pt.y;
@@ -140,21 +185,29 @@ void Optimizer::BundleAdjustment(const vector<KeyFrame *> &vpKFs, const vector<M
 
                 optimizer.addEdge(e);
             }
-            else
+            else // 双目相机
             {
+                // 观测值是 3×1 的向量，内容是什么呢？是相机的 xyz 位置？
                 Eigen::Matrix<double,3,1> obs;
                 const float kp_ur = pKF->mvuRight[mit->second];
                 obs << kpUn.pt.x, kpUn.pt.y, kp_ur;
 
+                // 实例化一条边
                 g2o::EdgeStereoSE3ProjectXYZ* e = new g2o::EdgeStereoSE3ProjectXYZ();
 
+                // 边的顶点-0 是地表点
+                // 边的顶点-1 是相机 pose
                 e->setVertex(0, dynamic_cast<g2o::OptimizableGraph::Vertex*>(optimizer.vertex(id)));
                 e->setVertex(1, dynamic_cast<g2o::OptimizableGraph::Vertex*>(optimizer.vertex(pKF->mnId)));
+                // 观测值。重投影误差计算中，观测值应该是像素坐标
                 e->setMeasurement(obs);
+                // 计算了信息矩阵，相当于先验信息
                 const float &invSigma2 = pKF->mvInvLevelSigma2[kpUn.octave];
                 Eigen::Matrix3d Info = Eigen::Matrix3d::Identity()*invSigma2;
                 e->setInformation(Info);
 
+                // 是否需要鲁棒核函数
+                // 默认的和函数是 Huber 核函数
                 if(bRobust)
                 {
                     g2o::RobustKernelHuber* rk = new g2o::RobustKernelHuber;
@@ -162,6 +215,8 @@ void Optimizer::BundleAdjustment(const vector<KeyFrame *> &vpKFs, const vector<M
                     rk->setDelta(thHuber3D);
                 }
 
+                // 没一个边都要有相机的内参
+                // 必须要填的项目
                 e->fx = pKF->fx;
                 e->fy = pKF->fy;
                 e->cx = pKF->cx;
@@ -184,12 +239,15 @@ void Optimizer::BundleAdjustment(const vector<KeyFrame *> &vpKFs, const vector<M
     }
 
     // Optimize!
+    // 步骤4：边和定点创建完后就可以优化了
     optimizer.initializeOptimization();
     optimizer.optimize(nIterations);
 
     // Recover optimized data
 
     //Keyframes
+    // 步骤5：优化后结果的取出
+    // vpKFs 是对关键帧的循环
     for(size_t i=0; i<vpKFs.size(); i++)
     {
         KeyFrame* pKF = vpKFs[i];
@@ -198,7 +256,9 @@ void Optimizer::BundleAdjustment(const vector<KeyFrame *> &vpKFs, const vector<M
         g2o::VertexSE3Expmap* vSE3 = static_cast<g2o::VertexSE3Expmap*>(optimizer.vertex(pKF->mnId));
         g2o::SE3Quat SE3quat = vSE3->estimate();
         if(nLoopKF==0)
+        // nLoopKF 也是入参，用来控制取出结果是否结束的
         {
+            // 优化后的结果重新写入了 pKF，即入参数之中对每个数都修正好了
             pKF->SetPose(Converter::toCvMat(SE3quat));
         }
         else
@@ -210,6 +270,7 @@ void Optimizer::BundleAdjustment(const vector<KeyFrame *> &vpKFs, const vector<M
     }
 
     //Points
+    // vpMP 是对地表点的循环
     for(size_t i=0; i<vpMP.size(); i++)
     {
         if(vbNotIncludedMP[i])
@@ -219,10 +280,14 @@ void Optimizer::BundleAdjustment(const vector<KeyFrame *> &vpKFs, const vector<M
 
         if(pMP->isBad())
             continue;
+        // 把优化后的地表点从过程的顶点集合中索引出来
+        // 强制转换为 g2o 的地标点类
         g2o::VertexSBAPointXYZ* vPoint = static_cast<g2o::VertexSBAPointXYZ*>(optimizer.vertex(pMP->mnId+maxKFid+1));
 
         if(nLoopKF==0)
         {
+            // 作者的自己写的 Converter 类
+            // 可以吧 Eigen 的 3 维向量转换成 opencv 的 Mat 类型向量
             pMP->SetWorldPos(Converter::toCvMat(vPoint->estimate()));
             pMP->UpdateNormalAndDepth();
         }
