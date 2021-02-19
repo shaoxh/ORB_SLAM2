@@ -120,8 +120,12 @@ public:
     // The following variables are accesed from only 1 thread or never change (no mutex needed).
 public:
 
+    // nNextID名字改为nLastID更合适，表示上一个KeyFrame的ID号
     static long unsigned int nNextId;
+    // 在nNextID的基础上加1就得到了mnID，为当前KeyFrame的ID号
     long unsigned int mnId;
+    // 每个KeyFrame基本属性是它是一个Frame，KeyFrame初始化的时候需要Frame，
+    // mnFrameId记录了该KeyFrame是由哪个Frame初始化的
     const long unsigned int mnFrameId;
 
     const double mTimeStamp;
