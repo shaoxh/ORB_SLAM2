@@ -197,8 +197,8 @@ public:
 
   Vector3d cam_project(const Vector3d & trans_xyz) const;
 
-  Vector3d Xw;
-  double fx, fy, cx, cy, bf;
+  Vector3d Xw; ///< MapPoint在世界坐标系的位置
+    double fx, fy, cx, cy, bf;
 };
 
 

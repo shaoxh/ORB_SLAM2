@@ -139,6 +139,9 @@ public:
 
     // Corresponding stereo coordinate and depth for each keypoint.
     // "Monocular" keypoints have a negative value.
+    // 对于双目，mvuRight存储了左目像素点在右目中的对应点的横坐标
+    // mvDepth对应的深度
+    // 单目摄像头，这两个容器中存的都是-1
     std::vector<float> mvuRight;
     std::vector<float> mvDepth;
 
