@@ -305,6 +305,8 @@ void Optimizer::BundleAdjustment(const vector<KeyFrame *> &vpKFs, const vector<M
 /**
  * @brief Pose Only Optimization
  *
+ * 该优化函数主要用于Tracking线程中：运动跟踪、参考帧跟踪、地图跟踪、重定位
+ *
  * 3D-2D 最小化重投影误差 e = (u,v) - project(Tcw*Pw) \n
  * 这个重投影误差的计算实际上涉及了如下三步：
  * Tcw×Pw 把 world 坐标系下的点转到相机坐标系中;
@@ -568,16 +570,17 @@ int Optimizer::PoseOptimization(Frame *pFrame)
 /**
  * @brief Local Bundle Adjustment
  *
+ * 该优化函数用于LocalMapping线程的局部BA优化 \n
  * 1. Vertex:
  *     - g2o::VertexSE3Expmap()，LocalKeyFrames，即当前关键帧的位姿、与当前关键帧相连的关键帧的位姿
  *     - g2o::VertexSE3Expmap()，FixedCameras，即能观测到LocalMapPoints的关键帧（并且不属于LocalKeyFrames）的位姿，在优化中这些关键帧的位姿不变
  *     - g2o::VertexSBAPointXYZ()，LocalMapPoints，即LocalKeyFrames能观测到的所有MapPoints的位置
- * 2. Edge:
- *     - g2o::EdgeSE3ProjectXYZ()，BaseBinaryEdge
+ *  2. Edge:
+ *     - g2o::EdgeSE3ProjectXYZ()，BaseBinaryEdge 单目
  *         + Vertex：关键帧的Tcw，MapPoint的Pw
  *         + measurement：MapPoint在关键帧中的二维位置(u,v)
  *         + InfoMatrix: invSigma2(与特征点所在的尺度有关)
- *     - g2o::EdgeStereoSE3ProjectXYZ()，BaseBinaryEdge
+ *     - g2o::EdgeStereoSE3ProjectXYZ()，BaseBinaryEdge 双目
  *         + Vertex：关键帧的Tcw，MapPoint的Pw
  *         + measurement：MapPoint在关键帧中的二维位置(ul,v,ur)
  *         + InfoMatrix: invSigma2(与特征点所在的尺度有关)
@@ -589,12 +592,21 @@ int Optimizer::PoseOptimization(Frame *pFrame)
 void Optimizer::LocalBundleAdjustment(KeyFrame *pKF, bool* pbStopFlag, Map* pMap)
 {    
     // Local KeyFrames: First Breath Search from Current Keyframe
+    // 准备 KF 关键帧类的顶点
+    // Local KeyFrames 里面有两种 KF
+    // 一种 KF 是当前关键帧，另一种是与当前 KF 相连的一些 KF
     list<KeyFrame*> lLocalKeyFrames;
 
+    // 取出当前 KF push 到 localKF 里面
     lLocalKeyFrames.push_back(pKF);
+    // nNextID名字改为nLastID更合适，表示上一个KeyFrame的ID号
+    // 在nNextID的基础上加1就得到了mnID，为当前KeyFrame的ID号
+    // mnId 为当前 KF 的 ID 号
     pKF->mnBALocalForKF = pKF->mnId;
 
+    // 取出与当前相连的 KFs push 到 localKF 里面
     const vector<KeyFrame*> vNeighKFs = pKF->GetVectorCovisibleKeyFrames();
+    // 聪明的写法，不需要每次都 get size。在固定循环里面 iend 里面写好了。
     for(int i=0, iend=vNeighKFs.size(); i<iend; i++)
     {
         KeyFrame* pKFi = vNeighKFs[i];
@@ -604,6 +616,7 @@ void Optimizer::LocalBundleAdjustment(KeyFrame *pKF, bool* pbStopFlag, Map* pMap
     }
 
     // Local MapPoints seen in Local KeyFrames
+    // 准备 MapPoint 类的顶点
     list<MapPoint*> lLocalMapPoints;
     for(list<KeyFrame*>::iterator lit=lLocalKeyFrames.begin() , lend=lLocalKeyFrames.end(); lit!=lend; lit++)
     {
@@ -614,6 +627,7 @@ void Optimizer::LocalBundleAdjustment(KeyFrame *pKF, bool* pbStopFlag, Map* pMap
             if(pMP)
                 if(!pMP->isBad())
                     if(pMP->mnBALocalForKF!=pKF->mnId)
+                        // 用这个当作标志，防止重复添加 MapPoint
                     {
                         lLocalMapPoints.push_back(pMP);
                         pMP->mnBALocalForKF=pKF->mnId;
@@ -622,16 +636,25 @@ void Optimizer::LocalBundleAdjustment(KeyFrame *pKF, bool* pbStopFlag, Map* pMap
     }
 
     // Fixed Keyframes. Keyframes that see Local MapPoints but that are not Local Keyframes
+    // 准备第二类 关键帧类的定点：能看到 local map points 的所有其他关键针
     list<KeyFrame*> lFixedCameras;
     for(list<MapPoint*>::iterator lit=lLocalMapPoints.begin(), lend=lLocalMapPoints.end(); lit!=lend; lit++)
     {
         map<KeyFrame*,size_t> observations = (*lit)->GetObservations();
+        // 真好！没一个 local point 都存储了能观察到它的 KF 们，把它已经放在了名为 Observations 的 Map 中
+        // 这个 Map 里面，key 是 KF 的指针
+        // value 是该 point 对应 KF 里面的 map point 的序号，也就是顺着 size_t 就可以在这个 kf 里面找到那个 map point
         for(map<KeyFrame*,size_t>::iterator mit=observations.begin(), mend=observations.end(); mit!=mend; mit++)
         {
             KeyFrame* pKFi = mit->first;
 
+            // pKFi->mnBALocalForKF==pKF->mnId 的时候表示的是上一类的局部关键帧。
+            // 前面已经把当前关键帧的 id（即这里的 mnId） 赋值给 localKF 里面的所有的 KF 的 mnBALocalForKF 成员了。
+            // 所以，当pKFi->mnBALocalForKF 和 pKF->mnId不相等的时候，表示的是现在第二类的关键帧
+            // 对于第二类的关键帧要在优化的时候 fix 住，所以把当前关键帧的 id 赋值给 mnBAFixedForKF 这个变量，以标志他是一个 fix 的关键帧，而且是为了 mnId 这个当前关键帧 fixed 住的
             if(pKFi->mnBALocalForKF!=pKF->mnId && pKFi->mnBAFixedForKF!=pKF->mnId)
-            {                
+            {
+                // 所以对于 fix 的关键帧，把当前关键帧的 id 赋值给 mnBAFixedForKF 这个变量
                 pKFi->mnBAFixedForKF=pKF->mnId;
                 if(!pKFi->isBad())
                     lFixedCameras.push_back(pKFi);
@@ -654,27 +677,36 @@ void Optimizer::LocalBundleAdjustment(KeyFrame *pKF, bool* pbStopFlag, Map* pMap
         optimizer.setForceStopFlag(pbStopFlag);
 
     unsigned long maxKFid = 0;
+    // 到后面让地表类型的定点 id 顺着 maxKFid 编号下去
 
     // Set Local KeyFrame vertices
+    // 第一类关键帧顶点（localKF 顶点）的创建
     for(list<KeyFrame*>::iterator lit=lLocalKeyFrames.begin(), lend=lLocalKeyFrames.end(); lit!=lend; lit++)
     {
         KeyFrame* pKFi = *lit;
         g2o::VertexSE3Expmap * vSE3 = new g2o::VertexSE3Expmap();
         vSE3->setEstimate(Converter::toSE3Quat(pKFi->GetPose()));
         vSE3->setId(pKFi->mnId);
+        // 注意！这里就表明了优化过程不要 fixed 它，让它参与优化
+        // 即优化这个关键帧顶点的位姿
         vSE3->setFixed(pKFi->mnId==0);
         optimizer.addVertex(vSE3);
         if(pKFi->mnId>maxKFid)
+            // 这个 maxKFid 就是用来建立顶点 Id 索引的
+            // 到后面让地表类型的定点 id 顺着 maxKFid 编号下去（但不是紧接着）
             maxKFid=pKFi->mnId;
     }
 
     // Set Fixed KeyFrame vertices
+    // 第二类关键帧顶点（fixedKF 顶点）的创建
     for(list<KeyFrame*>::iterator lit=lFixedCameras.begin(), lend=lFixedCameras.end(); lit!=lend; lit++)
     {
         KeyFrame* pKFi = *lit;
         g2o::VertexSE3Expmap * vSE3 = new g2o::VertexSE3Expmap();
         vSE3->setEstimate(Converter::toSE3Quat(pKFi->GetPose()));
         vSE3->setId(pKFi->mnId);
+        // 注意！这里就表明了优化过程要 fixed 它，不让它参与优化
+        // 即不优化这个关键帧顶点的位姿
         vSE3->setFixed(true);
         optimizer.addVertex(vSE3);
         if(pKFi->mnId>maxKFid)
@@ -684,6 +716,8 @@ void Optimizer::LocalBundleAdjustment(KeyFrame *pKF, bool* pbStopFlag, Map* pMap
     // Set MapPoint vertices
     const int nExpectedSize = (lLocalKeyFrames.size()+lFixedCameras.size())*lLocalMapPoints.size();
 
+    // 初始化 Mono 的顶点和边
+    // 一种有三种：地表点的顶点 vpMapPointEdgeMono、vpEdgeKFMono、vpEdgesMono
     vector<g2o::EdgeSE3ProjectXYZ*> vpEdgesMono;
     vpEdgesMono.reserve(nExpectedSize);
 
@@ -693,12 +727,19 @@ void Optimizer::LocalBundleAdjustment(KeyFrame *pKF, bool* pbStopFlag, Map* pMap
     vector<MapPoint*> vpMapPointEdgeMono;
     vpMapPointEdgeMono.reserve(nExpectedSize);
 
+    // 初始化 Stereo 的地标顶点和边
+    // 这里又新声明了三个变量存放 边和边两端的顶点，是为了后续优化后对误差大的边的删除更加方便
+    // 因为这里存的是指针，所以操作这三个变量里面的东西，实际上就是操作 optimizer 里面的东西
+    // 有可能存放的是边
+    // vector 的 reserve 函数是预先申请内存空间，不然每次新增就要分配一次空间。这样做的话可以减少内存空间分配的次数，提高效率。
     vector<g2o::EdgeStereoSE3ProjectXYZ*> vpEdgesStereo;
     vpEdgesStereo.reserve(nExpectedSize);
 
+    // 有可能存放的是边中的 1 索引：位姿点
     vector<KeyFrame*> vpEdgeKFStereo;
     vpEdgeKFStereo.reserve(nExpectedSize);
 
+    // 有可能存放的是边中的 0 索引：地标点
     vector<MapPoint*> vpMapPointEdgeStereo;
     vpMapPointEdgeStereo.reserve(nExpectedSize);
 
@@ -707,9 +748,12 @@ void Optimizer::LocalBundleAdjustment(KeyFrame *pKF, bool* pbStopFlag, Map* pMap
 
     for(list<MapPoint*>::iterator lit=lLocalMapPoints.begin(), lend=lLocalMapPoints.end(); lit!=lend; lit++)
     {
+        // 对没一个 来自 localKF 的 local map point 循环从而正式构建顶点并添加到 optimizer 中
         MapPoint* pMP = *lit;
         g2o::VertexSBAPointXYZ* vPoint = new g2o::VertexSBAPointXYZ();
         vPoint->setEstimate(Converter::toVector3d(pMP->GetWorldPos()));
+        // 让地表类型的定点 id 顺着 maxKFid 编号下去（但不是紧接着）
+        // mnId 是当前的 KF id 号。maxKFid 记录了
         int id = pMP->mnId+maxKFid+1;
         vPoint->setId(id);
         vPoint->setMarginalized(true);
@@ -718,6 +762,7 @@ void Optimizer::LocalBundleAdjustment(KeyFrame *pKF, bool* pbStopFlag, Map* pMap
         const map<KeyFrame*,size_t> observations = pMP->GetObservations();
 
         //Set edges
+        // 步骤8：对每一对关联的MapPoint和KeyFrame构建边
         for(map<KeyFrame*,size_t>::const_iterator mit=observations.begin(), mend=observations.end(); mit!=mend; mit++)
         {
             KeyFrame* pKFi = mit->first;
@@ -780,6 +825,7 @@ void Optimizer::LocalBundleAdjustment(KeyFrame *pKF, bool* pbStopFlag, Map* pMap
                     e->bf = pKFi->mbf;
 
                     optimizer.addEdge(e);
+                    // vpEdges 存的是边; vpEdgeKF 存的是顶点-1 相机位姿; MapPointEdge 村的是定点-2 地标点;
                     vpEdgesStereo.push_back(e);
                     vpEdgeKFStereo.push_back(pKFi);
                     vpMapPointEdgeStereo.push_back(pMP);
@@ -801,10 +847,11 @@ void Optimizer::LocalBundleAdjustment(KeyFrame *pKF, bool* pbStopFlag, Map* pMap
         if(*pbStopFlag)
             bDoMore = false;
 
-    if(bDoMore)
-    {
+    if(bDoMore){
 
     // Check inlier observations
+    // 步骤10：检测outlier，并设置下次不优化
+    // 单目
     for(size_t i=0, iend=vpEdgesMono.size(); i<iend;i++)
     {
         g2o::EdgeSE3ProjectXYZ* e = vpEdgesMono[i];
@@ -821,6 +868,7 @@ void Optimizer::LocalBundleAdjustment(KeyFrame *pKF, bool* pbStopFlag, Map* pMap
         e->setRobustKernel(0);
     }
 
+    // 双目
     for(size_t i=0, iend=vpEdgesStereo.size(); i<iend;i++)
     {
         g2o::EdgeStereoSE3ProjectXYZ* e = vpEdgesStereo[i];
@@ -831,6 +879,8 @@ void Optimizer::LocalBundleAdjustment(KeyFrame *pKF, bool* pbStopFlag, Map* pMap
 
         if(e->chi2()>7.815 || !e->isDepthPositive())
         {
+            // 误差 chi2 大的那条边不参与优化。不参与优化设置成 level == 1 就可以
+            // 因为默认 optimizer 优化的是 level == 0 的边
             e->setLevel(1);
         }
 
@@ -839,15 +889,25 @@ void Optimizer::LocalBundleAdjustment(KeyFrame *pKF, bool* pbStopFlag, Map* pMap
 
     // Optimize again without the outliers
 
+    // 步骤11：排除误差较大的outlier后再次优化
+    // initializeOptimization 函数里干了什么：
+    // 遍历vset集合，取出每个顶点的边
+    // 把所有的顶点（Vertex）插入到vset的集合中（set不用担心插入了相同的顶点）https://www.jianshu.com/p/e16ffb5b265d
+    //（这里每个边都有一个level的概念，默认情况下，g2o只处理level=0的边，在orbslam中，如果确定某个边的重投影误差过大，则把level设置为1，也就是舍弃这个边对于整个优化的影响）
+    // 并判断边所连接的顶点是否都是有效的（在vset中），如果是，则认为这是一个有效的边和顶点，并分别加入到_activeEdges和_activeVertices中（妈妈在也不用担心边少顶点或者图中没有边的顶点了）
     optimizer.initializeOptimization(0);
     optimizer.optimize(10);
 
     }
 
+    // 这是个 pair 们的 vector，pair 的内容是 kf 的指针和 mp 的指针
+    // 组成这个 pair vector 的目的是：收集误差较大的顶点，然后都删了
     vector<pair<KeyFrame*,MapPoint*> > vToErase;
     vToErase.reserve(vpEdgesMono.size()+vpEdgesStereo.size());
 
-    // Check inlier observations       
+    // Check inlier observations
+    // 步骤12：在优化后重新计算误差，剔除连接误差比较大的关键帧和MapPoint
+    // 上述优化完后再检查一边，如果还是超过阈值，就直接删除这条边和相应的定点
     for(size_t i=0, iend=vpEdgesMono.size(); i<iend;i++)
     {
         g2o::EdgeSE3ProjectXYZ* e = vpEdgesMono[i];
@@ -863,9 +923,11 @@ void Optimizer::LocalBundleAdjustment(KeyFrame *pKF, bool* pbStopFlag, Map* pMap
         }
     }
 
+    // 双目看这里
     for(size_t i=0, iend=vpEdgesStereo.size(); i<iend;i++)
     {
         g2o::EdgeStereoSE3ProjectXYZ* e = vpEdgesStereo[i];
+        // pMP 是边中的地表点顶点
         MapPoint* pMP = vpMapPointEdgeStereo[i];
 
         if(pMP->isBad())
@@ -873,7 +935,9 @@ void Optimizer::LocalBundleAdjustment(KeyFrame *pKF, bool* pbStopFlag, Map* pMap
 
         if(e->chi2()>7.815 || !e->isDepthPositive())
         {
+            // pKFi 是边中的相机位姿顶点
             KeyFrame* pKFi = vpEdgeKFStereo[i];
+            // 把它们组合成一个 pair 用以删除
             vToErase.push_back(make_pair(pKFi,pMP));
         }
     }
@@ -881,6 +945,8 @@ void Optimizer::LocalBundleAdjustment(KeyFrame *pKF, bool* pbStopFlag, Map* pMap
     // Get Map Mutex
     unique_lock<mutex> lock(pMap->mMutexMapUpdate);
 
+    // 连接偏差比较大，在关键帧中剔除对该MapPoint的观测
+    // 连接偏差比较大，在MapPoint中剔除对该关键帧的观测
     if(!vToErase.empty())
     {
         for(size_t i=0;i<vToErase.size();i++)
@@ -893,6 +959,7 @@ void Optimizer::LocalBundleAdjustment(KeyFrame *pKF, bool* pbStopFlag, Map* pMap
     }
 
     // Recover optimized data
+    // 步骤13：优化后更新关键帧位姿以及MapPoints的位置、平均观测方向等属性
 
     //Keyframes
     for(list<KeyFrame*>::iterator lit=lLocalKeyFrames.begin(), lend=lLocalKeyFrames.end(); lit!=lend; lit++)
