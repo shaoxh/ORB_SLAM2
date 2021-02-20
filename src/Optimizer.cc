@@ -1355,6 +1355,7 @@ int Optimizer::OptimizeSim3(KeyFrame *pKF1, KeyFrame *pKF2, vector<MapPoint *> &
         if(pMP1 && pMP2)
         {
             if(!pMP1->isBad() && !pMP2->isBad() && i2>=0)
+            // 增加 map point 类型的顶点
             {
                 g2o::VertexSBAPointXYZ* vPoint1 = new g2o::VertexSBAPointXYZ();
                 cv::Mat P3D1w = pMP1->GetWorldPos();

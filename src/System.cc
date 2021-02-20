@@ -92,6 +92,10 @@ System::System(const string &strVocFile, const string &strSettingsFile, const eS
     mptLocalMapping = new thread(&ORB_SLAM2::LocalMapping::Run,mpLocalMapper);
 
     //Initialize the Loop Closing thread and launch
+    // 通过检测闭环来消除 SLAM 系统的累计误差是比较直接且有效的方式。
+    // 在局部建图线程处理完每一帧关键帧序列之后会将该关键帧保存到 mlploopKeyFrameQueue 队列中送到闭环检测线程，进行闭环检测
+    // （BoW 二进制词典匹配检测，通过 Sim3 算法计算相似变换），发现闭环之后进行闭环矫正（闭环融合和图优化）
+    // 闭环检测线程并行地运行在 ==LoopClosing::Run()== 函数中
     mpLoopCloser = new LoopClosing(mpMap, mpKeyFrameDatabase, mpVocabulary, mSensor!=MONOCULAR);
     mptLoopClosing = new thread(&ORB_SLAM2::LoopClosing::Run, mpLoopCloser);
 
